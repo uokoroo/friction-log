@@ -1,0 +1,12 @@
+name = "friction-log"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "friction-log"
+database_id = "cc3ba718-6590-4ef8-ae14-1d052082e071"
+migrations_dir = "migrations"
+
+# Secret, set with: npx wrangler secret put LOG_TOKEN
+# (or in the Cloudflare dashboard under the Worker's Settings > Variables and Secrets)
