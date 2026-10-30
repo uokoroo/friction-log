@@ -31,6 +31,12 @@ export default {
         await env.DB.prepare('DELETE FROM entries WHERE id = ?').bind(id).run();
         return json({ ok: true });
       }
+      if (pathname.startsWith('/api/entries/') && request.method === 'PATCH') {
+        return correctEntry(decodeURIComponent(pathname.slice('/api/entries/'.length)), request, env);
+      }
+      // Voice: dictated text (iOS Shortcut) or recorded audio (laptop form).
+      if (pathname === '/api/voice' && request.method === 'POST') return voiceText(request, env);
+      if (pathname === '/api/voice/audio' && request.method === 'POST') return voiceAudio(request, env, url);
       if (pathname === '/api/summary' && request.method === 'GET') return summary(env);
       if (pathname === '/api/export.csv' && request.method === 'GET') return exportCsv(env);
     }
@@ -94,9 +100,161 @@ async function createEntries(request, env) {
   return json({ ok: true, saved: entries.map((e) => e.id) }, 201);
 }
 
+// ---------- voice + classification ----------
+
+const TRANSCRIBE_MODEL = '@cf/openai/whisper-large-v3-turbo';
+const CLASSIFY_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+const MAX_AUDIO_BYTES = 8 * 1024 * 1024;
+
+const CLASSIFY_PROMPT = `You classify short spoken notes about moments of friction when using a computer or phone.
+Pick exactly one type:
+- "channel": the person knew exactly what they wanted, but physically getting it into the device was slow or awkward (typing on a phone keyboard, tiny tap targets, autocorrect, hands busy, pointing precision).
+- "abstraction": they had to translate a goal into many steps, screens, apps or settings; the device needed too much spelling out.
+- "context": the situation made the device hard to use (walking, cooking, cold, noise, one hand free, socially awkward to speak or look at a screen).
+- "unclassified": the note is not about computer or phone friction, or is too vague to tell.
+Also extract:
+- setting: one of "desk", "sofa", "commute", "walking", "other", only if the note says or clearly implies it; otherwise null.
+- steps: an integer only if the note states a number of steps, taps, screens or clicks; otherwise null.
+Respond with JSON only.`;
+
+const CLASSIFY_SCHEMA = {
+  type: 'object',
+  properties: {
+    type: { type: 'string', enum: [...TYPES, 'unclassified'] },
+    setting: { type: ['string', 'null'], enum: [...SETTINGS, null] },
+    steps: { type: ['integer', 'null'] },
+  },
+  required: ['type', 'setting', 'steps'],
+};
+
+async function classify(env, text) {
+  const fallback = { type: 'unclassified', setting: null, steps: null };
+  try {
+    const r = await env.AI.run(CLASSIFY_MODEL, {
+      messages: [
+        { role: 'system', content: CLASSIFY_PROMPT },
+        { role: 'user', content: text },
+      ],
+      response_format: { type: 'json_schema', json_schema: CLASSIFY_SCHEMA },
+      max_tokens: 100,
+      temperature: 0,
+    });
+    const out = typeof r.response === 'string' ? JSON.parse(r.response) : r.response;
+    return {
+      type: [...TYPES, 'unclassified'].includes(out?.type) ? out.type : 'unclassified',
+      setting: SETTINGS.includes(out?.setting) ? out.setting : null,
+      steps: Number.isInteger(out?.steps) && out.steps >= 0 && out.steps <= 1000 ? out.steps : null,
+    };
+  } catch (err) {
+    console.error('classify failed', err);
+    return fallback;
+  }
+}
+
+async function saveVoiceEntry(env, { text, device, id, created_at }) {
+  const note = text.trim().slice(0, 500);
+  const c = await classify(env, note);
+  const entry = {
+    id: typeof id === 'string' && id.length >= 8 && id.length <= 64 ? id : crypto.randomUUID(),
+    created_at: typeof created_at === 'string' && !Number.isNaN(Date.parse(created_at)) ? new Date(created_at).toISOString() : new Date().toISOString(),
+    device: DEVICES.includes(device) ? device : 'iphone',
+    note,
+    ...c,
+    source: 'voice',
+    classified_by: 'model',
+  };
+  await env.DB.prepare(
+    'INSERT OR IGNORE INTO entries (id, created_at, device, type, setting, note, steps, source, classified_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+  )
+    .bind(entry.id, entry.created_at, entry.device, entry.type, entry.setting, entry.note, entry.steps, entry.source, entry.classified_by)
+    .run();
+  return entry;
+}
+
+// Plain-language confirmation, short enough for an iOS notification.
+function confirmation(e) {
+  if (e.type === 'unclassified') return 'Logged. Not sure of the type, review it on the summary page.';
+  return 'Logged as ' + [e.type, e.setting, e.steps != null ? e.steps + ' steps' : null].filter(Boolean).join(', ') + '.';
+}
+
+async function voiceText(request, env) {
+  if (!env.AI) return json({ error: 'AI binding is not configured' }, 500);
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'invalid JSON' }, 400);
+  }
+  const text = typeof body?.text === 'string' ? body.text.trim() : '';
+  if (!text) return json({ error: 'text is required' }, 400);
+  const entry = await saveVoiceEntry(env, { ...body, text });
+  return json({ ok: true, entry, message: confirmation(entry) }, 201);
+}
+
+async function voiceAudio(request, env, url) {
+  if (!env.AI) return json({ error: 'AI binding is not configured' }, 500);
+  const buf = await request.arrayBuffer();
+  if (!buf.byteLength) return json({ error: 'empty audio' }, 400);
+  if (buf.byteLength > MAX_AUDIO_BYTES) return json({ error: 'audio too long, keep it under a minute' }, 413);
+
+  let text = '';
+  try {
+    const r = await env.AI.run(TRANSCRIBE_MODEL, { audio: toBase64(buf), language: 'en' });
+    text = (r?.text || '').trim();
+  } catch (err) {
+    console.error('transcribe failed', err);
+    return json({ error: 'transcription failed' }, 502);
+  }
+  if (!text) return json({ error: 'no speech detected' }, 422);
+
+  const entry = await saveVoiceEntry(env, {
+    text,
+    device: url.searchParams.get('device'),
+    id: url.searchParams.get('id'),
+    created_at: url.searchParams.get('at'),
+  });
+  return json({ ok: true, entry, message: confirmation(entry) }, 201);
+}
+
+function toBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+// Correcting a model's guess marks the entry as user-classified.
+async function correctEntry(id, request, env) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'invalid JSON' }, 400);
+  }
+  const sets = [];
+  const vals = [];
+  if ('type' in body) {
+    if (!TYPES.includes(body.type)) return json({ error: 'bad type' }, 400);
+    sets.push('type = ?'); vals.push(body.type);
+  }
+  if ('setting' in body) {
+    if (body.setting != null && !SETTINGS.includes(body.setting)) return json({ error: 'bad setting' }, 400);
+    sets.push('setting = ?'); vals.push(body.setting ?? null);
+  }
+  if ('steps' in body) {
+    if (body.steps != null && (!Number.isInteger(body.steps) || body.steps < 0 || body.steps > 1000)) return json({ error: 'bad steps' }, 400);
+    sets.push('steps = ?'); vals.push(body.steps ?? null);
+  }
+  if (!sets.length) return json({ error: 'nothing to change' }, 400);
+  sets.push("classified_by = 'user'");
+  const r = await env.DB.prepare('UPDATE entries SET ' + sets.join(', ') + ' WHERE id = ?').bind(...vals, id).run();
+  if (r?.meta && r.meta.changes === 0) return json({ error: 'not found' }, 404);
+  return json({ ok: true });
+}
+
 async function summary(env) {
   const db = env.DB;
-  const [total, byType, byDevice, bySetting, byDay, steps, recent] = await db.batch([
+  const [total, byType, byDevice, bySetting, byDay, steps, recent, review] = await db.batch([
     db.prepare('SELECT COUNT(*) AS n, MIN(created_at) AS first, MAX(created_at) AS last FROM entries'),
     db.prepare('SELECT type AS k, COUNT(*) AS n FROM entries GROUP BY type ORDER BY n DESC'),
     db.prepare('SELECT device AS k, COUNT(*) AS n FROM entries GROUP BY device ORDER BY n DESC'),
@@ -104,6 +262,7 @@ async function summary(env) {
     db.prepare('SELECT substr(created_at, 1, 10) AS k, COUNT(*) AS n FROM entries GROUP BY k ORDER BY k'),
     db.prepare('SELECT type AS k, ROUND(AVG(steps), 1) AS avg_steps, COUNT(steps) AS n FROM entries WHERE steps IS NOT NULL GROUP BY type'),
     db.prepare('SELECT * FROM entries ORDER BY created_at DESC LIMIT 100'),
+    db.prepare("SELECT COUNT(*) AS model, SUM(type = 'unclassified') AS unclassified FROM entries WHERE classified_by = 'model'"),
   ]);
   return json({
     total: total.results[0],
@@ -113,12 +272,13 @@ async function summary(env) {
     byDay: byDay.results,
     avgSteps: steps.results,
     recent: recent.results,
+    review: { model: review.results[0].model || 0, unclassified: review.results[0].unclassified || 0 },
   });
 }
 
 async function exportCsv(env) {
   const { results } = await env.DB.prepare('SELECT * FROM entries ORDER BY created_at').all();
-  const cols = ['id', 'created_at', 'device', 'type', 'setting', 'note', 'steps', 'received_at'];
+  const cols = ['id', 'created_at', 'device', 'type', 'setting', 'note', 'steps', 'source', 'classified_by', 'received_at'];
   const esc = (v) => (v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
   const csv = [cols.join(','), ...results.map((r) => cols.map((c) => esc(r[c])).join(','))].join('\n');
   return new Response(csv, {
@@ -255,6 +415,13 @@ const FORM_PAGE = `<!doctype html>
 #status { min-height: 22px; margin-top: 12px; font-size: 14px; display: flex; justify-content: space-between; gap: 8px; }
 #status .ok { color: var(--ok); } #status .warn { color: var(--warn); }
 #undo { padding: 4px 10px; font-size: 13px; }
+.voice { width: 100%; padding: 18px; margin-bottom: 12px; font-weight: 700; font-size: 17px; display: flex; align-items: center; justify-content: center; gap: 10px; }
+.voice .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); }
+.voice.rec { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.voice.rec .dot { background: var(--accent-text); animation: pulse 1s infinite; }
+.voice.busy { opacity: .6; }
+@keyframes pulse { 50% { opacity: .3; } }
+.or { text-align: center; margin: 4px 0 12px; }
 .setup { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
 .setup button { margin-top: 10px; padding: 12px 16px; background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
 .hint { margin-top: 20px; }
@@ -273,6 +440,8 @@ kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--border); borde
   </section>
 
   <form id="form" hidden>
+    <button type="button" class="voice" id="voice"><span class="dot"></span><span id="voiceLabel">Speak it</span></button>
+    <p class="muted or">or type it</p>
     <textarea id="note" maxlength="500" placeholder="What were you trying to do?" required></textarea>
     <div class="types" role="group" aria-label="Friction type">
       <button type="button" class="type" data-v="channel" aria-pressed="false">Channel<small>input too slow</small></button>
@@ -305,7 +474,8 @@ kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--border); borde
   let type = null, setting = null, lastId = null;
 
   // ----- setup -----
-  function showForm() { $('setup').hidden = true; $('form').hidden = false; $('note').focus(); flush(); }
+  // No autofocus on the note, so the space bar can start voice capture on the laptop.
+  function showForm() { $('setup').hidden = true; $('form').hidden = false; flush(); }
   if (token) showForm(); else { $('setup').hidden = false; $('key').focus(); }
   $('saveKey').onclick = async () => {
     const k = $('key').value.trim();
@@ -337,7 +507,7 @@ kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--border); borde
   $('note').addEventListener('input', refresh);
 
   // Laptop shortcuts: Alt+1/2/3 picks the type, Cmd/Ctrl+Enter saves.
-  if (!isPhone) $('hint').innerHTML = '<kbd>Alt</kbd>+<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> picks the type, <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Enter</kbd> saves.';
+  if (!isPhone) $('hint').innerHTML = '<kbd>Space</kbd> starts and stops voice. When typing: <kbd>Alt</kbd>+<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd> picks the type, <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Enter</kbd> saves.';
   document.addEventListener('keydown', (e) => {
     // Match on e.code: on a Mac, Alt+1 types a symbol, so e.key is not '1'.
     if (e.altKey && ['Digit1', 'Digit2', 'Digit3'].includes(e.code)) { e.preventDefault(); typeBtns[+e.code.slice(-1) - 1].click(); }
@@ -399,7 +569,65 @@ kbd { font: 12px ui-monospace, monospace; border: 1px solid var(--border); borde
     setStatus(navigator.onLine ? 'Saved.' : 'Saved offline, will sync.', navigator.onLine ? 'ok' : 'warn', true);
     await flush();
     if (!queue().length && lastId === entry.id) setStatus('Saved.', 'ok', true);
-    if (!isPhone) $('note').focus();
+    document.activeElement.blur();
+  });
+
+  // ----- voice -----
+  // Tap to start, tap to stop (or it stops itself after 45 s). The Worker transcribes and classifies.
+  let recorder = null, chunks = [], stopTimer = null;
+  const voiceBtn = $('voice'), voiceLabel = $('voiceLabel');
+  const canRecord = !!(navigator.mediaDevices && window.MediaRecorder);
+  if (!canRecord) voiceBtn.hidden = true;
+
+  async function startRecording() {
+    let stream;
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+    catch { setStatus('Microphone blocked. Allow it in the browser settings.', 'warn'); return; }
+    const mime = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find((m) => MediaRecorder.isTypeSupported(m)) || '';
+    recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    chunks = [];
+    recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    recorder.onstop = () => { stream.getTracks().forEach((t) => t.stop()); upload(new Blob(chunks, { type: recorder.mimeType })); };
+    recorder.start();
+    voiceBtn.classList.add('rec'); voiceLabel.textContent = 'Listening… tap to finish';
+    stopTimer = setTimeout(stopRecording, 45000);
+  }
+  function stopRecording() {
+    clearTimeout(stopTimer);
+    if (recorder && recorder.state === 'recording') recorder.stop();
+    voiceBtn.classList.remove('rec');
+  }
+  async function upload(blob) {
+    if (blob.size < 1000) { voiceLabel.textContent = 'Speak it'; setStatus('Too short, try again.', 'warn'); return; }
+    if (!navigator.onLine) { voiceLabel.textContent = 'Speak it'; setStatus('Voice needs a connection. Type it instead.', 'warn'); return; }
+    voiceBtn.classList.add('busy'); voiceLabel.textContent = 'Working it out…';
+    const id = crypto.randomUUID();
+    try {
+      const r = await fetch('/api/voice/audio?device=' + device + '&id=' + id + '&at=' + encodeURIComponent(new Date().toISOString()), {
+        method: 'POST', headers: { Authorization: 'Bearer ' + token, 'Content-Type': blob.type || 'application/octet-stream' }, body: blob,
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || 'failed');
+      lastId = d.entry.id;
+      setStatus('"' + d.entry.note + '": ' + d.message, d.entry.type === 'unclassified' ? 'warn' : 'ok', true);
+    } catch (err) {
+      setStatus('Could not log that (' + err.message + '). Type it instead.', 'warn');
+    } finally {
+      voiceBtn.classList.remove('busy'); voiceLabel.textContent = 'Speak it';
+    }
+  }
+  voiceBtn.onclick = () => {
+    if (voiceBtn.classList.contains('busy')) return;
+    if (recorder && recorder.state === 'recording') stopRecording(); else startRecording();
+  };
+  // Opening /?voice=1 (e.g. from a hotkey) starts listening straight away where the browser allows it.
+  if (canRecord && new URLSearchParams(location.search).get('voice') === '1') {
+    const go = () => { if (token && !$('form').hidden) startRecording(); };
+    if (document.readyState === 'complete') go(); else window.addEventListener('load', go);
+  }
+  // Space bar on the laptop toggles recording when you're not typing.
+  document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' && canRecord && !['TEXTAREA', 'INPUT'].includes(document.activeElement.tagName)) { e.preventDefault(); voiceBtn.click(); }
   });
 
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
@@ -432,6 +660,11 @@ th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--bord
 th { color: var(--muted); font-weight: 600; }
 .tablewrap { overflow-x: auto; }
 #msg { color: var(--warn); }
+.review { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--warn); border-radius: 8px; padding: 10px 12px; font-size: 14px; }
+.guess { display: inline-flex; gap: 4px; align-items: center; }
+.guess select { font: inherit; font-size: 13px; color: var(--text); background: var(--surface); border: 1px dashed var(--warn); border-radius: 6px; padding: 3px 4px; }
+.guess .ok { padding: 2px 7px; font-size: 13px; }
+.fill.unclassified { background: var(--warn); }
 </style>
 </head>
 <body>
@@ -484,11 +717,37 @@ th { color: var(--muted); font-weight: 600; }
         html += '<h2>Average steps (entries with a count)</h2>' + d.avgSteps.map((s) =>
           '<div class="bar"><span>' + esc(s.k) + '</span><span></span><span class="num">' + s.avg_steps + ' (n=' + s.n + ')</span></div>').join('');
       }
+      if (d.review.model) {
+        html += '<p class="review">' + d.review.model + ' voice ' + (d.review.model === 1 ? 'entry was' : 'entries were') +
+          ' classified by the model' + (d.review.unclassified ? ', ' + d.review.unclassified + ' unclassified' : '') +
+          '. Check the type below: confirm with ✓ or pick the right one.</p>';
+      }
+      const TYPES = ['channel', 'abstraction', 'context'];
+      const typeCell = (e) => {
+        if (e.classified_by !== 'model') return esc(e.type);
+        const opts = (e.type === 'unclassified' ? '<option value="" selected disabled>unclassified</option>' : '') +
+          TYPES.map((t) => '<option' + (t === e.type ? ' selected' : '') + '>' + t + '</option>').join('');
+        return '<span class="guess"><select data-id="' + esc(e.id) + '">' + opts + '</select>' +
+          (e.type !== 'unclassified' ? '<button class="ok" data-id="' + esc(e.id) + '" title="Confirm">✓</button>' : '') + '</span>';
+      };
       html += '<h2>Recent entries</h2><div class="tablewrap"><table><thead><tr><th>When</th><th>Type</th><th>Device</th><th>Setting</th><th>Steps</th><th>Note</th></tr></thead><tbody>' +
         d.recent.map((e) => '<tr><td>' + esc(new Date(e.created_at).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })) +
-          '</td><td>' + esc(e.type) + '</td><td>' + esc(e.device) + '</td><td>' + esc(e.setting || '') + '</td><td>' + esc(e.steps ?? '') +
+          (e.source === 'voice' ? ' 🎙' : '') + '</td><td>' + typeCell(e) + '</td><td>' + esc(e.device) + '</td><td>' + esc(e.setting || '') + '</td><td>' + esc(e.steps ?? '') +
           '</td><td>' + esc(e.note) + '</td></tr>').join('') + '</tbody></table></div>';
       out.innerHTML = html;
+
+      // Saving a type (changed or confirmed) marks it as yours, so it stops counting as a model guess.
+      const save = async (id, type, cell) => {
+        const r = await fetch('/api/entries/' + encodeURIComponent(id), {
+          method: 'PATCH', headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ type }),
+        });
+        if (r.ok) cell.textContent = type; else msg.textContent = 'Could not save that change.';
+      };
+      out.querySelectorAll('.guess select').forEach((s) => s.onchange = () => save(s.dataset.id, s.value, s.closest('td')));
+      out.querySelectorAll('.guess .ok').forEach((b) => b.onclick = () => {
+        const s = b.parentElement.querySelector('select');
+        save(b.dataset.id, s.value, b.closest('td'));
+      });
     })
     .catch((e) => { msg.textContent = e.message || 'Could not load the summary.'; });
 })();
